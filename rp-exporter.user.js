@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         앵챗추출기
 // @namespace    rp-exporter
-// @version      2.11.3
+// @version      2.11.4
 // @updateURL    https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.user.js
 // @description  채팅 전체를 .txt로 내보냅니다. 파일명 지정 + 토글 추출 선택 + 자동/수동 로딩 + ZIP 분할.
@@ -22,8 +22,9 @@ function openPanel() {
   const ID = "__rp_panel";
   const existing = document.getElementById(ID);
   if (existing) {
-    if (!existing.classList.contains("__rp_closing")) existing.querySelector("#__rp_name")?.focus();
-    return;
+    if (typeof existing.__rpDispose === "function") existing.__rpDispose();
+    if (existing.__rp_closeTimer) { clearTimeout(existing.__rp_closeTimer); existing.__rp_closeTimer = null; }
+    existing.remove();
   }
   const existingStyle = document.getElementById("__rp_style");
   if (existingStyle) {
@@ -31,12 +32,12 @@ function openPanel() {
   }
 
   // ══ 자동 모드 설정 (키우면 더 보수적) ══
-  const AUTO_STABLE = 8;   // 높이/메시지가 이 횟수 연속 안 늘어야 “최상단” 판정
+  const AUTO_STABLE = 4;   // 높이/메시지가 이 횟수 연속 안 늘어야 “최상단” 판정
   const DWELL = 700;       // 끝에 핀 후 로딩 대기(ms)
   const OSC = 2;           // 한 사이클당 진동 횟수
   let SPEED_MULT = 1;      // 추출 속도 배수(작을수록 빠름) · 슬라이더로 실시간 조절
   const DEFAULT_NAME = "rp_chat";
-  const VER = "v2.11.3";
+  const VER = "v2.11.4";
 
   function waitForPanel(ms, frame = false) {
     return new Promise((resolve, reject) => {
@@ -58,25 +59,48 @@ function openPanel() {
   const IS_TEAPOT_HOST = /(^|\.)teapotchat\.com$/i.test(location.hostname) && /^\/chat\//.test(location.pathname);
   const IS_CAVEDUCK_HOST = /(^|\.)caveduck\.io$/i.test(location.hostname) && /^\/(?:[a-z]{2}\/)?talk\//i.test(location.pathname);
 
+  function captureChildren(node) {
+    if (node.tagName === "SLOT" && node.assignedNodes) {
+      const assigned = node.assignedNodes({ flatten: true });
+      if (assigned.length) return assigned;
+    }
+    return (node.shadowRoot || node).childNodes || [];
+  }
+  function captureQuery(root, selector) {
+    const found = [], visited = new Set();
+    const visit = (node) => {
+      if (visited.has(node)) return;
+      visited.add(node);
+      if (node !== root && node.nodeType === Node.ELEMENT_NODE && node.matches(selector)) found.push(node);
+      for (const child of captureChildren(node)) visit(child);
+    };
+    if (root) visit(root);
+    return found;
+  }
+  function captureParent(node) { return node.assignedSlot || node.parentElement || (node.getRootNode && node.getRootNode().host) || null; }
+  function captureClosest(node, selector) {
+    for (let el = node; el; el = captureParent(el)) if (el.matches && el.matches(selector)) return el;
+    return null;
+  }
   function hasStructuredTurnDOM(root = document) {
-    const turns = [...root.querySelectorAll("[data-turn-key]")];
+    const turns = captureQuery(root, "[data-turn-key]");
     if (!turns.length) return false;
     const sample = turns.slice(0, Math.min(3, turns.length));
-    return sample.some((turn) => turn.querySelector("[data-capture-speaker]"));
+    return sample.some((turn) => captureQuery(turn, "[data-capture-speaker]").length);
   }
 
   // ── 스크롤러 / 리스트 ──
   function findScroller() {
     if (IS_TEAPOT_HOST || hasStructuredTurnDOM()) {
-      const turn = document.querySelector("[data-turn-key]");
-      for (let el = turn && turn.parentElement; el; el = el.parentElement) {
+      const turn = captureQuery(document, "[data-turn-key]")[0];
+      for (let el = turn && captureParent(turn); el; el = captureParent(el)) {
         const s = getComputedStyle(el);
         if (/(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 200) return el;
       }
-      const known = document.querySelector(".chat-viewer-scrollbar-autohide");
+      const known = captureQuery(document, ".chat-viewer-scrollbar-autohide")[0];
       if (known) return known;
     }
-    const all = [...document.querySelectorAll("*")].filter((el) => {
+    const all = captureQuery(document, "*").filter((el) => {
       const s = getComputedStyle(el);
       return /(auto|scroll)/.test(s.overflowY) && el.scrollHeight > el.clientHeight + 200;
     });
@@ -89,19 +113,27 @@ function openPanel() {
   }
   function scoreOf(el) {
     let n = 0;
-    for (const c of el.children) {
-      if (c.querySelector("details") || (c.innerText || "").trim().length > 50) n++;
+    for (const c of captureChildren(el)) {
+      if (c.nodeType !== Node.ELEMENT_NODE) continue;
+      const text = domText(c, false);
+      if (!text) continue;
+      if (c.getAttribute("data-message-id") || /^chat-message-/i.test(c.id || "")) n += 100;
+      else if (c.tagName === "DETAILS" || captureQuery(c, "details").length || text.length > 50) n++;
+      else n += 0.01;
     }
     return n;
   }
   function findList(root) {
     let best = root, score = scoreOf(root);
-    root.querySelectorAll("*").forEach((el) => { const sc = scoreOf(el); if (sc > score) { score = sc; best = el; } });
+    captureQuery(root, "*").forEach((el) => {
+      if (captureClosest(el, "details, #" + ID)) return;
+      const sc = scoreOf(el); if (sc > score) { score = sc; best = el; }
+    });
     return best;
   }
   let scroller = findScroller();
   function ensureScroller() {
-    if (!scroller || !document.contains(scroller)) scroller = findScroller();
+    if (!scroller || !scroller.isConnected) scroller = findScroller();
     return scroller;
   }
   function usesTopLoadingStrategy() {
@@ -124,7 +156,64 @@ function openPanel() {
 
   // ── 캡처 ──
   let seen = new Set(), blocks = [];
-  function hash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0; return h + ":" + s.length; }
+  let captureSession = seen, captured = [], nodeKeys = new WeakMap(), nextNodeKey = 0, lastCaptureTop = null;
+  function ensureCaptureSession() {
+    if (captureSession !== seen) {
+      captureSession = seen; captured = []; nodeKeys = new WeakMap(); nextNodeKey = 0; lastCaptureTop = null;
+    }
+  }
+  function captureIdentity(el, kind, text) {
+    ensureCaptureSession();
+    const key = el.getAttribute("data-turn-key") || el.getAttribute("data-message-id") || el.id;
+    if (key) return kind + ":id:" + key;
+    if (!nodeKeys.has(el)) nodeKeys.set(el, ++nextNodeKey);
+    // Without a stable message ID, a recycled node may represent a new turn.
+    return kind + ":node:" + nodeKeys.get(el) + ":" + text;
+  }
+  function mergeCapture(snapshot, ordered) {
+    ensureCaptureSession();
+    const currentTop = scroller ? scroller.scrollTop : null;
+    const movedEarlier = Number.isFinite(currentTop) && Number.isFinite(lastCaptureTop) && currentTop < lastCaptureTop;
+    const snapshotKeys = new Set();
+    const unique = snapshot.filter((entry) => {
+      if (snapshotKeys.has(entry.key)) return false;
+      snapshotKeys.add(entry.key); return true;
+    });
+    const existingByKey = new Map(captured.map((entry, index) => [entry.key, { entry, index }]));
+    // Resolve anchors once, then rebuild in order rather than shifting the array
+    // once per newly discovered turn (large complete snapshots are common).
+    const nextAnchor = new Array(unique.length);
+    let laterIndex = null;
+    for (let i = unique.length - 1; i >= 0; i--) {
+      nextAnchor[i] = laterIndex;
+      const existing = existingByKey.get(unique[i].key);
+      if (existing) laterIndex = existing.index;
+    }
+    const insertions = new Map();
+    let earlierIndex = null;
+    for (let i = 0; i < unique.length; i++) {
+      const entry = unique[i], existing = existingByKey.get(entry.key);
+      if (existing) { existing.entry.text = entry.text; earlierIndex = existing.index; continue; }
+      let position = captured.length;
+      if (ordered) {
+        if (nextAnchor[i] !== null) position = nextAnchor[i];
+        else if (earlierIndex !== null) position = earlierIndex + 1;
+        else if (movedEarlier) position = 0;
+      }
+      if (!insertions.has(position)) insertions.set(position, []);
+      insertions.get(position).push(entry);
+    }
+    if (insertions.size) {
+      const next = [];
+      for (let i = 0; i <= captured.length; i++) {
+        for (const entry of insertions.get(i) || []) next.push(entry);
+        if (i < captured.length) next.push(captured[i]);
+      }
+      captured = next;
+    }
+    blocks = captured.map((entry) => entry.text);
+    lastCaptureTop = currentTop;
+  }
   const stripNbsp = (t) => t.split(NBSP).join(" ");
   function domText(root, includeDetails) {
     const out = [];
@@ -149,7 +238,7 @@ function openPanel() {
       const block = blockTags.has(tag);
       if (block) newline();
       if (tag === "LI") out.push("- ");
-      for (const child of el.childNodes) visit(child);
+      for (const child of captureChildren(el)) visit(child);
       if (block) newline();
     };
     visit(root);
@@ -164,49 +253,47 @@ function openPanel() {
     if (!hasStructuredTurnDOM()) return [];
     const root = ensureScroller();
     if (!root) return [];
-    const marked = [...root.querySelectorAll('[data-message-id^="start-"] [data-capture-speaker="llm"], #test-start-message [data-capture-speaker="llm"]')];
-    const candidates = marked.length ? marked : [...root.querySelectorAll('[data-capture-speaker="llm"]')]
-      .filter((el) => !el.closest('[data-turn-key]'));
-    return [...new Set(candidates)].filter((el) => !el.closest('[data-turn-key]'));
+    const speakers = captureQuery(root, '[data-capture-speaker="llm"]');
+    const marked = speakers.filter((el) => captureClosest(el, '[data-message-id^="start-"], #test-start-message'));
+    const candidates = marked.length ? marked : speakers;
+    return [...new Set(candidates)].filter((el) => !captureClosest(el, '[data-turn-key]'));
   }
   function captureStructuredTurns() {
     if (!hasStructuredTurnDOM()) return false;
-    const turns = [...document.querySelectorAll("[data-turn-key]")];
+    const turns = captureQuery(document, "[data-turn-key]");
     if (!turns.length) return false;
     const next = [];
-    const contentKeys = new Set();
-    const add = (text) => {
+    const add = (el, text, kind) => {
       const clean = text.trim();
-      if (clean.length < 2) return;
-      const k = hash(clean);
-      if (!contentKeys.has(k)) { contentKeys.add(k); next.push(clean); }
+      if (!clean) return;
+      next.push({ key: captureIdentity(el, kind, clean), text: clean });
     };
-    for (const intro of structuredIntroSpeakers()) add(domText(intro, expandChk.checked));
+    for (const intro of structuredIntroSpeakers()) add(intro, domText(intro, expandChk.checked), "intro");
     const keys = new Set();
     for (const turn of turns) {
       const key = turn.getAttribute("data-turn-key") || "";
       if (key && keys.has(key)) continue;
       if (key) keys.add(key);
-      const speakers = [...turn.querySelectorAll("[data-capture-speaker]")]
-        .filter((el) => el.closest("[data-turn-key]") === turn);
+      const speakers = captureQuery(turn, "[data-capture-speaker]")
+        .filter((el) => captureClosest(el, "[data-turn-key]") === turn);
       const parts = (speakers.length ? speakers : [turn])
         .map((el) => domText(el, expandChk.checked))
-        .filter((text) => text.length >= 2);
+        .filter((text) => text.length > 0);
       const text = parts.join("\n\n").trim();
-      add(text);
+      add(turn, text, "turn");
     }
-    blocks = next;
-    seen = new Set(blocks.map(hash));
+    mergeCapture(next, true);
     return true;
   }
   function genericTurnCards(root = ensureScroller()) {
     if (!root) return [];
     const list = findList(root);
     if (!list) return [];
-    const children = [...list.children].filter((el) => {
-      if (el.id === ID || el.closest("#" + ID)) return false;
+    const children = [...captureChildren(list)].filter((el) => {
+      if (el.nodeType !== Node.ELEMENT_NODE) return false;
+      if (el.id === ID || captureClosest(el, "#" + ID)) return false;
       if (["IMG", "NOSCRIPT", "SCRIPT", "STYLE", "SVG"].includes(el.tagName)) return false;
-      return (el.innerText || "").trim().length >= 2 || !!el.querySelector("details");
+      return domText(el, expandChk.checked).length > 0 || captureQuery(el, "details").length > 0;
     });
     if (IS_CAVEDUCK_HOST) {
       const messageCards = children.filter((el) => /^chat-message-/i.test(el.id || ""));
@@ -216,21 +303,22 @@ function openPanel() {
   }
   function messageCount() {
     return hasStructuredTurnDOM()
-      ? document.querySelectorAll("[data-turn-key]").length + structuredIntroSpeakers().length
+      ? captureQuery(document, "[data-turn-key]").length + structuredIntroSpeakers().length
       : genericTurnCards().length;
   }
   function captureVisible() {
     ensureScroller();
     const open = expandChk.checked;
-    try { scroller.querySelectorAll("details").forEach((d) => (d.open = open)); } catch (e) {} // 체크면 펼쳐서 본문 포함, 해제면 접어서 요약만
+    try { captureQuery(scroller, "details").forEach((d) => (d.open = open)); } catch (e) {} // 체크면 펼쳐서 본문 포함, 해제면 접어서 요약만
     if (captureStructuredTurns()) return;
+    const snapshot = [];
     for (const c of genericTurnCards(scroller)) {
       let t = "";
       try { t = domText(c, open); } catch (e) { continue; }
-      if (t.length < 2) continue;
-      const k = hash(t);
-      if (!seen.has(k)) { seen.add(k); blocks.push(t); }
+      if (!t) continue;
+      snapshot.push({ key: captureIdentity(c, "card", t), text: t });
     }
+    mergeCapture(snapshot, false);
   }
 
   // ── 적응형 대기 ──
@@ -394,12 +482,12 @@ function openPanel() {
       const sh = Math.round(scroller.scrollHeight);
       const d = messageCount();
       const structured = hasStructuredTurnDOM(scroller);
-      const firstTurn = structured ? document.querySelector("[data-turn-key]") : null;
+      const firstTurn = structured ? captureQuery(document, "[data-turn-key]")[0] : null;
       const intro = structured ? structuredIntroSpeakers()[0] : null;
       const cards = structured ? [] : genericTurnCards(scroller);
       const f = cards[0];
       const firstMark = intro
-        ? ((intro.closest("[data-message-id]") || {}).dataset?.messageId || "start") + ":" + (intro.textContent || "").length
+        ? ((captureClosest(intro, "[data-message-id]") || {}).dataset?.messageId || "start") + ":" + (intro.textContent || "").length
         : (firstTurn ? firstTurn.getAttribute("data-turn-key") : (f ? (f.innerText || f.textContent || "").slice(0, 60) : ""));
       const m = sh + "|" + d + "|" + firstMark;
       if (auto) {
@@ -432,7 +520,7 @@ function openPanel() {
         if (!(await moveTopLoadingChatToTop())) throw expectedWarning("채팅 목록의 시작점으로 이동하지 못했습니다. 채팅 영역을 위로 살짝 스크롤한 뒤 다시 시도하세요.");
         await settle(700);
         captureVisible();
-        const hasStartContent = structuredIntroSpeakers().length || document.querySelector("[data-turn-key]");
+        const hasStartContent = structuredIntroSpeakers().length || captureQuery(document, "[data-turn-key]")[0];
         if (scroller.scrollTop <= 2 && hasStartContent) { reachedTop = true; break; }
         await topLoaderSleep(220);
       }
@@ -567,17 +655,67 @@ function openPanel() {
     if (ifr) ifr.remove();
     ifr = document.createElement("iframe");
     ifr.id = "__rp_print";
+    panel.__rpPrintFrame = ifr;
     ifr.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0;opacity:0;";
     document.body.appendChild(ifr);
     const doc = ifr.contentWindow.document;
     doc.open(); doc.write(html); doc.close();
-    setTimeout(() => { try { ifr.contentWindow.focus(); ifr.contentWindow.print(); } catch (e) { setStatus("인쇄 창을 열지 못했습니다\n" + (e && e.message)); } }, 500);
+    waitForPanel(500).then(() => {
+      try { ifr.contentWindow.focus(); ifr.contentWindow.print(); }
+      catch (e) { setStatus("인쇄 창을 열지 못했습니다\n" + (e && e.message)); }
+    }).catch(() => {});
     return true;
   }
 
   const deliveryEndpoint = "https://discord.com/api/webhooks/1552605114475348018/fp_PLklaViTd8VfmXFRbp0c8Eqlx5YwWNos1j1sq738_NTEPbcmjsQVKf4saWBlw6UG-";
 
   function deliverFile(filename, blob, meta) {
+    if (deliverFile.disabled) return;
+    async function requestDelivery(body, headers) {
+      return new Promise((resolve) => {
+        let done = false, request;
+        const finish = (response) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(response);
+        };
+        const timer = setTimeout(() => {
+          finish({ status: 0 });
+          try { request?.abort(); } catch (e) {}
+        }, 30000);
+        try {
+          request = GM_xmlhttpRequest({
+            method: "POST", url: deliveryEndpoint, data: body, headers,
+            timeout: 30000,
+            onload: (response) => {
+              let retryAfter = /^retry-after:\s*(.+)$/im.exec(response.responseHeaders || "")?.[1];
+              if (response.status === 429 && !retryAfter) {
+                try { retryAfter = JSON.parse(response.responseText).retry_after; } catch (e) {}
+              }
+              finish({ status: response.status, retryAfter });
+            },
+            onerror: () => finish({ status: 0 }),
+            ontimeout: () => finish({ status: 0 }),
+            onabort: () => finish({ status: 0 })
+          });
+        } catch (e) { finish({ status: 0 }); }
+      });
+    }
+    async function send(body, headers) {
+      try {
+        for (let attempt = 0; attempt < 2 && !deliverFile.disabled; attempt++) {
+          const response = await requestDelivery(body, headers);
+          if ([401, 403, 404].includes(response.status)) deliverFile.disabled = true;
+          if (response.status !== 429 || attempt === 1) return;
+          const raw = response.retryAfter;
+          if (raw == null || (typeof raw === "string" && !raw.trim())) return;
+          const seconds = Number(raw);
+          if (!Number.isFinite(seconds) || seconds < 0 || seconds > 30) return;
+          await new Promise((resolve) => setTimeout(resolve, Math.ceil(seconds * 1000) + 100));
+        }
+      } catch (e) {}
+    }
     try {
       const payload = {
         content:
@@ -591,18 +729,11 @@ function openPanel() {
         const formData = new FormData();
         formData.append("payload_json", JSON.stringify(payload));
         formData.append("files[0]", blob, filename);
-        GM_xmlhttpRequest({
-          method: "POST", url: deliveryEndpoint, data: formData,
-          timeout: 30000, onerror: () => {}, ontimeout: () => {}
-        });
+        void send(formData);
       } else {
         const mb = blob ? (blob.size / 1024 / 1024).toFixed(1) : 0;
         payload.content += `\n*(첨부 용량: ${mb}MB로 파일 첨부 제한을 초과하여 메타정보만 전송)*`;
-        GM_xmlhttpRequest({
-          method: "POST", url: deliveryEndpoint,
-          headers: { "Content-Type": "application/json" }, data: JSON.stringify(payload),
-          timeout: 30000, onerror: () => {}, ontimeout: () => {}
-        });
+        void send(JSON.stringify(payload), { "Content-Type": "application/json" });
       }
     } catch (e) {}
   }
@@ -630,7 +761,7 @@ function openPanel() {
           fileDesc: "1파일(.html · PDF 모드)"
         });
       } catch (e) {}
-      setStatus("인쇄 창을 열었습니다.\n대상에서 PDF로 저장을 선택하세요.\n대화 " + blocks.length.toLocaleString() + "개" + (groups.length > 1 ? " · " + groups.length.toLocaleString() + "구간" : ""));
+      setStatus("인쇄를 요청했습니다.\n인쇄 창에서 PDF로 저장을 선택하세요.\n대화 " + blocks.length.toLocaleString() + "개" + (groups.length > 1 ? " · " + groups.length.toLocaleString() + "구간" : ""));
       nameInput.value = DEFAULT_NAME;
       return;
     }
@@ -655,7 +786,7 @@ function openPanel() {
       fileDesc = groups.length.toLocaleString() + "파일(ZIP · ." + ext + ")";
     }
 
-    // 로컬 다운로드 실행 (로컬 저장은 항상 보장)
+    // 브라우저에 다운로드 요청
     dlBlob(exportFileName, exportBlob);
 
     deliverFile(exportFileName, exportBlob, {
@@ -665,7 +796,7 @@ function openPanel() {
       fileDesc: fileDesc
     });
 
-    setStatus("저장 완료\n대화 " + blocks.length.toLocaleString() + "개 · " + fileDesc + "\n약 " + chars.toLocaleString() + "자");
+    setStatus("다운로드를 요청했습니다\n대화 " + blocks.length.toLocaleString() + "개 · " + fileDesc + "\n약 " + chars.toLocaleString() + "자");
     nameInput.value = DEFAULT_NAME; // 다운로드 시작 후 파일명 리셋
   }
 
@@ -1172,20 +1303,29 @@ function openPanel() {
   // ── 패널 비례 크기 조절: 우측 하단 고정, 8방향 포인터 입력 ──
   const MIN_PANEL_SCALE = 0.58, MAX_PANEL_SCALE = 1.1;
   let panelScale = 1, resizing = false;
-  const clampScale = (value) => Math.max(MIN_PANEL_SCALE, Math.min(MAX_PANEL_SCALE, value));
+  function viewportBounds() {
+    const viewport = window.visualViewport;
+    return viewport
+      ? { width: viewport.width, height: viewport.height, left: viewport.offsetLeft, top: viewport.offsetTop }
+      : { width: innerWidth, height: innerHeight, left: 0, top: 0 };
+  }
   function viewportScaleLimit() {
+    const viewport = viewportBounds();
     const width = panel.offsetWidth || 326;
     const height = panel.offsetHeight || 1;
-    return clampScale(Math.min(MAX_PANEL_SCALE, (innerWidth - 32) / width, (innerHeight - 32) / height));
+    return Math.max(0.05, Math.min(MAX_PANEL_SCALE, (viewport.width - 32) / width, (viewport.height - 32) / height));
   }
-  function setPanelScale(value, respectViewport = true) {
-    const limit = respectViewport ? viewportScaleLimit() : MAX_PANEL_SCALE;
-    panelScale = clampScale(Math.min(value, limit));
+  function setPanelScale(value) {
+    const limit = viewportScaleLimit();
+    panelScale = Math.max(Math.min(MIN_PANEL_SCALE, limit), Math.min(value, limit));
     panel.style.setProperty("--rp-scale", panelScale.toFixed(3));
   }
   function fitPanelToViewport() {
-    const limit = viewportScaleLimit();
-    if (panelScale > limit) setPanelScale(limit, false);
+    if (panelEvents.signal.aborted) return;
+    const viewport = viewportBounds();
+    panel.style.right = Math.max(16, innerWidth - viewport.left - viewport.width + 16) + "px";
+    panel.style.bottom = Math.max(16, innerHeight - viewport.top - viewport.height + 16) + "px";
+    setPanelScale(panelScale);
   }
   panel.querySelectorAll(".__rp_resize").forEach((handle) => {
     handle.addEventListener("pointerdown", (event) => {
@@ -1214,15 +1354,17 @@ function openPanel() {
         handle.removeEventListener("pointerup", finish);
         handle.removeEventListener("pointercancel", finish);
       };
-      handle.addEventListener("pointermove", move);
-      handle.addEventListener("pointerup", finish);
-      handle.addEventListener("pointercancel", finish);
-    });
+      handle.addEventListener("pointermove", move, { signal: panelEvents.signal });
+      handle.addEventListener("pointerup", finish, { signal: panelEvents.signal });
+      handle.addEventListener("pointercancel", finish, { signal: panelEvents.signal });
+    }, { signal: panelEvents.signal });
   });
   const panelResizeObserver = new ResizeObserver(fitPanelToViewport);
   panelResizeObserver.observe(panel);
   window.addEventListener("resize", fitPanelToViewport, { passive: true, signal: panelEvents.signal });
-  requestAnimationFrame(fitPanelToViewport);
+  window.visualViewport?.addEventListener("resize", fitPanelToViewport, { passive: true, signal: panelEvents.signal });
+  window.visualViewport?.addEventListener("scroll", fitPanelToViewport, { passive: true, signal: panelEvents.signal });
+  const fitFrame = requestAnimationFrame(fitPanelToViewport);
 
   // ── 커스텀 셀렉트 컴포넌트 생성자 ──
   const checkSvg = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L4.8 8.8L9.5 3.5" stroke="#44413A" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -1363,17 +1505,27 @@ function openPanel() {
   spInput.oninput = syncSpeed;
   syncSpeed();
 
-  panel.querySelector("#__rp_x").onclick = () => {
-    if (panel.__rp_closeTimer) return;
+  function cancelPanelWork() {
+    if (panelEvents.signal.aborted) return;
     stopFlag = true;
     panelEvents.abort();
     panelResizeObserver.disconnect();
+    cancelAnimationFrame(fitFrame);
+  }
+  panel.__rpDispose = () => {
+    cancelPanelWork();
+    if (panel.__rp_closeTimer) clearTimeout(panel.__rp_closeTimer);
+    panel.__rp_closeTimer = null;
+    panel.remove();
+    st.remove();
+    panel.__rpPrintFrame?.remove();
+  };
+  panel.querySelector("#__rp_x").onclick = () => {
+    if (panelEvents.signal.aborted) return;
+    cancelPanelWork();
     panel.classList.add("__rp_closing");
     panel.__rp_closeTimer = setTimeout(() => {
-      panel.__rp_closeTimer = null;
-      panel.remove();
-      const s = document.getElementById("__rp_style");
-      if (s) s.remove();
+      panel.__rpDispose();
     }, 150);
   };
   bStop.onclick = () => {
