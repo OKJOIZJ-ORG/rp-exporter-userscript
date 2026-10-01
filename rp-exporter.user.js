@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         앵챗추출기
 // @namespace    rp-exporter
-// @version      2.11.4
+// @version      2.11.5
 // @updateURL    https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.user.js
 // @description  채팅 전체를 .txt로 내보냅니다. 파일명 지정 + 토글 추출 선택 + 자동/수동 로딩 + ZIP 분할.
@@ -37,7 +37,7 @@ function openPanel() {
   const OSC = 2;           // 한 사이클당 진동 횟수
   let SPEED_MULT = 1;      // 추출 속도 배수(작을수록 빠름) · 슬라이더로 실시간 조절
   const DEFAULT_NAME = "rp_chat";
-  const VER = "v2.11.4";
+  const VER = "v2.11.5";
 
   function waitForPanel(ms, frame = false) {
     return new Promise((resolve, reject) => {
@@ -58,6 +58,7 @@ function openPanel() {
   const SEP = "\n\n────────────────────────\n\n";
   const IS_TEAPOT_HOST = /(^|\.)teapotchat\.com$/i.test(location.hostname) && /^\/chat\//.test(location.pathname);
   const IS_CAVEDUCK_HOST = /(^|\.)caveduck\.io$/i.test(location.hostname) && /^\/(?:[a-z]{2}\/)?talk\//i.test(location.pathname);
+  const IS_RIRU_HOST = /(^|\.)riru\.ai$/i.test(location.hostname) && /^\/chat\//.test(location.pathname);
 
   function captureChildren(node) {
     if (node.tagName === "SLOT" && node.assignedNodes) {
@@ -91,6 +92,10 @@ function openPanel() {
 
   // ── 스크롤러 / 리스트 ──
   function findScroller() {
+    if (IS_RIRU_HOST) {
+      const known = captureQuery(document, '[data-virtuoso-scroller="true"]')[0];
+      if (known) return known;
+    }
     if (IS_TEAPOT_HOST || hasStructuredTurnDOM()) {
       const turn = captureQuery(document, "[data-turn-key]")[0];
       for (let el = turn && captureParent(turn); el; el = captureParent(el)) {
@@ -164,7 +169,8 @@ function openPanel() {
   }
   function captureIdentity(el, kind, text) {
     ensureCaptureSession();
-    const key = el.getAttribute("data-turn-key") || el.getAttribute("data-message-id") || el.id;
+    const key = el.getAttribute("data-turn-key") || el.getAttribute("data-message-id") ||
+      (IS_RIRU_HOST && el.getAttribute("data-chat-message-id")) || el.id;
     if (key) return kind + ":id:" + key;
     if (!nodeKeys.has(el)) nodeKeys.set(el, ++nextNodeKey);
     // Without a stable message ID, a recycled node may represent a new turn.
@@ -287,6 +293,14 @@ function openPanel() {
   }
   function genericTurnCards(root = ensureScroller()) {
     if (!root) return [];
+    if (IS_RIRU_HOST) {
+      // Riru virtualizes whole messages. Scoring their nested widgets can pick
+      // one assistant's body as the list and omit the user's sibling bubble.
+      return captureQuery(root, '[data-chat-message-anchor="true"]')
+        .filter((el) => el.getAttribute("data-chat-message-id") &&
+          /^(user|assistant)$/.test(el.getAttribute("data-chat-message-role") || ""))
+        .sort((a, b) => Number(a.getAttribute("data-chat-message-index")) - Number(b.getAttribute("data-chat-message-index")));
+    }
     const list = findList(root);
     if (!list) return [];
     const children = [...captureChildren(list)].filter((el) => {
@@ -318,7 +332,7 @@ function openPanel() {
       if (!t) continue;
       snapshot.push({ key: captureIdentity(c, "card", t), text: t });
     }
-    mergeCapture(snapshot, false);
+    mergeCapture(snapshot, IS_RIRU_HOST);
   }
 
   // ── 적응형 대기 ──
@@ -550,12 +564,16 @@ function openPanel() {
     }
     scroller.scrollTop = -1e9; await sleep(120); const a1 = scroller.scrollTop;
     scroller.scrollTop = 1e9; await sleep(120); const a2 = scroller.scrollTop;
-    const min = Math.min(a1, a2), max = Math.max(a1, a2);
-    const ch = scroller.clientHeight || 500; const step = Math.max(ch * 0.8, 300);
+    const min = Math.min(a1, a2);
+    let max = Math.max(a1, a2);
+    const ch = scroller.clientHeight || 500;
+    const step = IS_RIRU_HOST ? Math.max(1, ch * 0.8) : Math.max(ch * 0.8, 300);
     let pos = min; scroller.scrollTop = min; await settle(350); captureVisible();
+    if (IS_RIRU_HOST) max = Math.max(0, scroller.scrollHeight - ch);
     let s = 0;
     while (pos < max - 2 && s < 8000 && !stopFlag) {
       s++; pos = Math.min(pos + step, max); scroller.scrollTop = pos; await settle(350); captureVisible();
+      if (IS_RIRU_HOST) max = Math.max(0, scroller.scrollHeight - ch);
       const pct = Math.round(((pos - min) / ((max - min) || 1)) * 100);
       setStatus("대화를 파일로 정리하는 중\n진행 " + pct + "% · " + blocks.length.toLocaleString() + "개 수집");
     }
