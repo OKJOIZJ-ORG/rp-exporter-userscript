@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         앵챗추출기
 // @namespace    rp-exporter
-// @version      2.11.5
+// @version      2.11.6
 // @updateURL    https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.user.js
 // @description  채팅 전체를 .txt로 내보냅니다. 파일명 지정 + 토글 추출 선택 + 자동/수동 로딩 + ZIP 분할.
@@ -37,7 +37,7 @@ function openPanel() {
   const OSC = 2;           // 한 사이클당 진동 횟수
   let SPEED_MULT = 1;      // 추출 속도 배수(작을수록 빠름) · 슬라이더로 실시간 조절
   const DEFAULT_NAME = "rp_chat";
-  const VER = "v2.11.5";
+  const VER = "v2.11.6";
 
   function waitForPanel(ms, frame = false) {
     return new Promise((resolve, reject) => {
@@ -84,6 +84,7 @@ function openPanel() {
     return null;
   }
   function hasStructuredTurnDOM(root = document) {
+    if (IS_CAVEDUCK_HOST) return false;
     const turns = captureQuery(root, "[data-turn-key]");
     if (!turns.length) return false;
     const sample = turns.slice(0, Math.min(3, turns.length));
@@ -91,7 +92,20 @@ function openPanel() {
   }
 
   // ── 스크롤러 / 리스트 ──
+  function caveduckCards(root = document) {
+    if (!IS_CAVEDUCK_HOST) return [];
+    const first = root.querySelector?.('[id^="chat-message-"]');
+    const list = first?.parentElement;
+    return list ? [...list.children].filter((el) => /^chat-message-/i.test(el.id || "")) : [];
+  }
   function findScroller() {
+    if (IS_CAVEDUCK_HOST) {
+      const first = document.querySelector('[id^="chat-message-"]');
+      for (let el = first?.parentElement; el; el = el.parentElement) {
+        const style = getComputedStyle(el);
+        if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 200) return el;
+      }
+    }
     if (IS_RIRU_HOST) {
       const known = captureQuery(document, '[data-virtuoso-scroller="true"]')[0];
       if (known) return known;
@@ -293,6 +307,10 @@ function openPanel() {
   }
   function genericTurnCards(root = ensureScroller()) {
     if (!root) return [];
+    if (IS_CAVEDUCK_HOST) {
+      const cards = caveduckCards(root);
+      if (cards.length) return cards;
+    }
     if (IS_RIRU_HOST) {
       // Riru virtualizes whole messages. Scoring their nested widgets can pick
       // one assistant's body as the list and omit the user's sibling bubble.
@@ -344,7 +362,7 @@ function openPanel() {
       if (stopFlag) break;
       ensureScroller();
       let len = 0;
-      try { len = (hasStructuredTurnDOM(scroller) ? scroller.textContent : scroller.innerText).length; } catch (e) { break; }
+      try { len = (IS_CAVEDUCK_HOST || hasStructuredTurnDOM(scroller) ? scroller.textContent : scroller.innerText).length; } catch (e) { break; }
       if (len === lastLen) stable++; else stable = 0;
       lastLen = len;
       if (stable >= 2) break;
@@ -494,16 +512,18 @@ function openPanel() {
       await oscillate();
       if (stopFlag) break;
       const sh = Math.round(scroller.scrollHeight);
-      const d = messageCount();
       const structured = hasStructuredTurnDOM(scroller);
       const firstTurn = structured ? captureQuery(document, "[data-turn-key]")[0] : null;
       const intro = structured ? structuredIntroSpeakers()[0] : null;
       const cards = structured ? [] : genericTurnCards(scroller);
+      const d = structured ? messageCount() : cards.length;
       const f = cards[0];
-      const firstMark = intro
+      const firstMark = IS_CAVEDUCK_HOST && cards.length
+        ? cards[0].id + "|" + cards[cards.length - 1].id
+        : intro
         ? ((captureClosest(intro, "[data-message-id]") || {}).dataset?.messageId || "start") + ":" + (intro.textContent || "").length
         : (firstTurn ? firstTurn.getAttribute("data-turn-key") : (f ? (f.innerText || f.textContent || "").slice(0, 60) : ""));
-      const m = sh + "|" + d + "|" + firstMark;
+      const m = (IS_CAVEDUCK_HOST ? "" : sh + "|") + d + "|" + firstMark;
       if (auto) {
         if (m === last) stable++; else { stable = 0; last = m; }
         setStatus(
@@ -528,6 +548,26 @@ function openPanel() {
   async function sweepCapture() {
     scroller = findScroller();
     seen = new Set(); blocks = [];
+    if (IS_CAVEDUCK_HOST) {
+      const cards = caveduckCards(scroller);
+      if (cards.length) {
+        const batch = [];
+        for (let i = 0; i < cards.length && !stopFlag; i++) {
+          const card = cards[i];
+          if (!card.isConnected) throw expectedWarning("대화 목록이 바뀌었습니다. 채팅방에서 다시 추출해 주세요.");
+          card.querySelectorAll("details").forEach((detail) => { detail.open = expandChk.checked; });
+          const text = domText(card, expandChk.checked);
+          if (text) batch.push({ key: captureIdentity(card, "card", text), text });
+          if ((i + 1) % 8 === 0 || i === cards.length - 1) {
+            mergeCapture(batch.splice(0), false);
+            setStatus("대화를 파일로 정리하는 중\n진행 " + (i + 1).toLocaleString() + "/" + cards.length.toLocaleString() + "개");
+            await sleep(0);
+          }
+        }
+        if (!stopFlag) setStatus("대화 수집 완료 · 파일 저장 중\n" + blocks.length.toLocaleString() + "개 수집됨");
+        return;
+      }
+    }
     if (usesTopLoadingStrategy()) {
       let reachedTop = false;
       for (let attempt = 0; attempt < 6 && !stopFlag; attempt++) {
