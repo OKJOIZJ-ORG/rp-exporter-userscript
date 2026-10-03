@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         앵챗추출기
 // @namespace    rp-exporter
-// @version      2.11.6
+// @version      2.11.7
 // @updateURL    https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.user.js
 // @description  채팅 전체를 .txt로 내보냅니다. 파일명 지정 + 토글 추출 선택 + 자동/수동 로딩 + ZIP 분할.
@@ -37,7 +37,7 @@ function openPanel() {
   const OSC = 2;           // 한 사이클당 진동 횟수
   let SPEED_MULT = 1;      // 추출 속도 배수(작을수록 빠름) · 슬라이더로 실시간 조절
   const DEFAULT_NAME = "rp_chat";
-  const VER = "v2.11.6";
+  const VER = "v2.11.7";
 
   function waitForPanel(ms, frame = false) {
     return new Promise((resolve, reject) => {
@@ -59,6 +59,7 @@ function openPanel() {
   const IS_TEAPOT_HOST = /(^|\.)teapotchat\.com$/i.test(location.hostname) && /^\/chat\//.test(location.pathname);
   const IS_CAVEDUCK_HOST = /(^|\.)caveduck\.io$/i.test(location.hostname) && /^\/(?:[a-z]{2}\/)?talk\//i.test(location.pathname);
   const IS_RIRU_HOST = /(^|\.)riru\.ai$/i.test(location.hostname) && /^\/chat\//.test(location.pathname);
+  const IS_GEMINI_HOST = location.hostname === "gemini.google.com";
 
   function captureChildren(node) {
     if (node.tagName === "SLOT" && node.assignedNodes) {
@@ -99,6 +100,10 @@ function openPanel() {
     return list ? [...list.children].filter((el) => /^chat-message-/i.test(el.id || "")) : [];
   }
   function findScroller() {
+    if (IS_GEMINI_HOST) {
+      const history = document.querySelector("infinite-scroller.chat-history");
+      if (history) return history;
+    }
     if (IS_CAVEDUCK_HOST) {
       const first = document.querySelector('[id^="chat-message-"]');
       for (let el = first?.parentElement; el; el = el.parentElement) {
@@ -167,6 +172,7 @@ function openPanel() {
     const host = location.hostname || "현재 페이지";
     if (IS_TEAPOT_HOST) return { name: host, mode: "안정형 상단 로딩" };
     if (IS_CAVEDUCK_HOST) return { name: host, mode: "역방향 카드 로딩" };
+    if (IS_GEMINI_HOST) return { name: host, mode: "대화별 순서 인식" };
     if (hasStructuredTurnDOM()) return { name: host, mode: usesTopLoadingStrategy() ? "상단 로딩 자동 인식" : "구조형 대화 인식" };
     const root = ensureScroller();
     const reversed = root && (getComputedStyle(root).flexDirection === "column-reverse" || /flex-col-reverse/.test(root.className || ""));
@@ -305,6 +311,21 @@ function openPanel() {
     mergeCapture(next, true);
     return true;
   }
+  function geminiTurns() {
+    const root = ensureScroller();
+    const history = root?.matches?.("infinite-scroller.chat-history") ? root
+      : root?.querySelector?.("infinite-scroller.chat-history");
+    if (!history) return [];
+    const turns = [];
+    for (const conversation of history.children) {
+      if (!conversation.classList.contains("conversation-container")) continue;
+      const user = conversation.querySelector(":scope > user-query user-query-content");
+      const model = conversation.querySelector(":scope > model-response model-response-content");
+      if (user) turns.push({ conversation, role: "user", content: user });
+      if (model) turns.push({ conversation, role: "model", content: model });
+    }
+    return turns;
+  }
   function genericTurnCards(root = ensureScroller()) {
     if (!root) return [];
     if (IS_CAVEDUCK_HOST) {
@@ -334,6 +355,7 @@ function openPanel() {
     return children;
   }
   function messageCount() {
+    if (IS_GEMINI_HOST) return geminiTurns().length;
     return hasStructuredTurnDOM()
       ? captureQuery(document, "[data-turn-key]").length + structuredIntroSpeakers().length
       : genericTurnCards().length;
@@ -342,6 +364,14 @@ function openPanel() {
     ensureScroller();
     const open = expandChk.checked;
     try { captureQuery(scroller, "details").forEach((d) => (d.open = open)); } catch (e) {} // 체크면 펼쳐서 본문 포함, 해제면 접어서 요약만
+    if (IS_GEMINI_HOST) {
+      const snapshot = geminiTurns().map(({ conversation, role, content }) => ({
+        key: "gemini:" + (conversation.id || captureIdentity(conversation, "pair", "")) + ":" + role,
+        text: domText(content, open)
+      })).filter((entry) => entry.text);
+      mergeCapture(snapshot, true);
+      return;
+    }
     if (captureStructuredTurns()) return;
     const snapshot = [];
     for (const c of genericTurnCards(scroller)) {
@@ -515,11 +545,15 @@ function openPanel() {
       const structured = hasStructuredTurnDOM(scroller);
       const firstTurn = structured ? captureQuery(document, "[data-turn-key]")[0] : null;
       const intro = structured ? structuredIntroSpeakers()[0] : null;
-      const cards = structured ? [] : genericTurnCards(scroller);
+      const cards = structured ? [] : IS_GEMINI_HOST
+        ? geminiTurns().map((turn) => turn.content) : genericTurnCards(scroller);
       const d = structured ? messageCount() : cards.length;
       const f = cards[0];
       const firstMark = IS_CAVEDUCK_HOST && cards.length
         ? cards[0].id + "|" + cards[cards.length - 1].id
+        : IS_GEMINI_HOST && cards.length
+        ? (cards[0].closest(".conversation-container")?.id || "") + "|" +
+          (cards[cards.length - 1].closest(".conversation-container")?.id || "")
         : intro
         ? ((captureClosest(intro, "[data-message-id]") || {}).dataset?.messageId || "start") + ":" + (intro.textContent || "").length
         : (firstTurn ? firstTurn.getAttribute("data-turn-key") : (f ? (f.innerText || f.textContent || "").slice(0, 60) : ""));
@@ -607,17 +641,26 @@ function openPanel() {
     const min = Math.min(a1, a2);
     let max = Math.max(a1, a2);
     const ch = scroller.clientHeight || 500;
-    const step = IS_RIRU_HOST ? Math.max(1, ch * 0.8) : Math.max(ch * 0.8, 300);
+    const step = IS_RIRU_HOST || IS_GEMINI_HOST ? Math.max(1, ch * 0.8) : Math.max(ch * 0.8, 300);
     let pos = min; scroller.scrollTop = min; await settle(350); captureVisible();
-    if (IS_RIRU_HOST) max = Math.max(0, scroller.scrollHeight - ch);
+    max = Math.max(0, scroller.scrollHeight - ch);
     let s = 0;
     while (pos < max - 2 && s < 8000 && !stopFlag) {
       s++; pos = Math.min(pos + step, max); scroller.scrollTop = pos; await settle(350); captureVisible();
-      if (IS_RIRU_HOST) max = Math.max(0, scroller.scrollHeight - ch);
+      max = Math.max(0, scroller.scrollHeight - ch);
       const pct = Math.round(((pos - min) / ((max - min) || 1)) * 100);
       setStatus("대화를 파일로 정리하는 중\n진행 " + pct + "% · " + blocks.length.toLocaleString() + "개 수집");
     }
     scroller.scrollTop = max; await settle(350); captureVisible();
+    // A site may append another batch while the final viewport is settling.
+    for (let tail = 0; tail < 3 && !stopFlag; tail++) {
+      const nextMax = Math.max(0, scroller.scrollHeight - ch);
+      if (nextMax <= max + 2) break;
+      max = nextMax;
+      scroller.scrollTop = max;
+      await settle(350);
+      captureVisible();
+    }
     scroller.scrollTop = 0;
     setStatus("대화 수집 완료 · 파일 저장 중\n" + blocks.length.toLocaleString() + "개 수집됨");
   }
@@ -1276,33 +1319,64 @@ function openPanel() {
   const ctl = field + "flex:1;min-width:0;margin:0";
   const card = "background:#F4F2EA;border:1px solid #E4E0D4;border-radius:12px;padding:12px;margin-bottom:14px;position:relative";
   const platform = detectPlatform();
-
-  panel.innerHTML =
-    "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:13px'>" +
-    "<span style='display:flex;align-items:baseline;gap:8px'><span style='width:8px;height:8px;border-radius:2px;background:#44413A;align-self:center'></span><span style='font-size:14px;font-weight:600;letter-spacing:-.01em;color:" + INK + "'>앵챗추출기</span>" + (VER ? "<span style='font-size:10px;font-weight:600;letter-spacing:.02em;color:" + FAINT + ";transform:translateY(-0.5px)'>" + VER + "</span>" : "") + "</span>" +
-    "<span id='__rp_x' title='닫기'>✕</span></div>" +
-    "<div style='background:#E7E3D8;border:1px solid #D9D4C7;border-radius:10px;padding:8px 10px;margin-bottom:11px'>" +
-    "<div style='display:flex;align-items:center;justify-content:space-between;gap:10px'><span style='font-size:10.5px;font-weight:600;letter-spacing:.02em;color:" + LABEL + "'>인식된 플랫폼</span><strong style='font-size:12px;color:" + INK + ";font-weight:700'>" + platform.name + "</strong></div>" +
-    "<div style='margin-top:2px;text-align:right;font-size:10.5px;color:" + SOFT + "'>" + platform.mode + "</div></div>" +
-    "<div style='" + card + "'>" +
-    "<div style='" + rowS + "'><span style='" + rlbl + "'>파일 이름</span><input id='__rp_name' type='text' value='" + DEFAULT_NAME + "' style='" + ctl + "'></div>" +
-    "<div style='" + rowS + "'><span style='" + rlbl + "'>파일 형식</span><div id='__rp_fmt_wrap' class='__rp_cselect_wrap'></div></div>" +
-    "<div style='" + rowS + "'><span style='" + rlbl + "'>분할 기준</span><div id='__rp_unit_wrap' class='__rp_cselect_wrap'></div></div>" +
-    "<div id='__rp_numrow' style='" + rowS + ";margin-bottom:0'><span style='" + rlbl + "'></span><input id='__rp_num' type='number' min='1' value='600000' style='" + ctl + "'><span id='__rp_suffix' style='font-size:12px;color:" + SOFT + ";white-space:nowrap;flex:none'>자마다</span></div>" +
-    "<label class='__rp_check_label'><input id='__rp_expand' class='__rp_check_input' type='checkbox' checked><span class='__rp_check_box' aria-hidden='true'></span><span>상태창·위젯 등 접힌 토글도 펼쳐서 추출</span></label>" +
-    "<div style='height:1px;background:" + LINE + ";margin:12px 0 0'></div>" +
-    "<div style='margin:11px 0 0'>" +
-    "<div style='font-size:11px;font-weight:600;letter-spacing:.02em;color:" + LABEL + ";margin-bottom:8px'>추출 속도</div>" +
-    "<input id='__rp_speed' type='range' min='0' max='4' step='1' value='2'>" +
-    "<div style='display:flex;align-items:center;margin-top:7px;font-size:9.5px;letter-spacing:.02em;color:" + FAINT + "'><span style='flex:1;text-align:left'>느림·안전</span><span id='__rp_spdlbl' style='flex:1;text-align:center;font-size:11px;font-weight:700;color:" + INK + "'>보통</span><span style='flex:1;text-align:right'>빠름</span></div>" +
-    "</div>" +
-    "</div>" +
-    "<button id='__rp_auto' class='__rp_btn __rp_auto'>자동 추출</button>" +
-    "<div style='height:1px;background:" + LINE + ";margin:13px 2px'></div>" +
-    "<div class='__rp_row' style='margin-bottom:8px'><button id='__rp_load' class='__rp_btn __rp_sec'>① 전체 로딩</button><button id='__rp_ext' class='__rp_btn __rp_sec'>② 추출·저장</button></div>" +
-    "<button id='__rp_stop' class='__rp_btn __rp_stop'>정지</button>" +
-    "<div id='__rp_status' class='__rp_status_card'>준비됨</div>" +
-    "";
+  // Build controls as nodes: some sites enforce Trusted Types for HTML sinks.
+  function make(tag, attrs = {}, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs)) {
+      if (key === "style") node.style.cssText = value;
+      else if (key === "text") node.textContent = value;
+      else if (key === "className") node.className = value;
+      else if (key === "ariaHidden") node.setAttribute("aria-hidden", value);
+      else node[key] = value;
+    }
+    node.append(...children);
+    return node;
+  }
+  const label = (text) => make("span", { style: rlbl, text });
+  const row = (...children) => make("div", { style: rowS }, ...children);
+  const rule = (margin) => make("div", { style: "height:1px;background:" + LINE + ";margin:" + margin });
+  const button = (id, className, text) => make("button", { id, className: "__rp_btn " + className, text });
+  const title = make("span", { style: "display:flex;align-items:baseline;gap:8px" },
+    make("span", { style: "width:8px;height:8px;border-radius:2px;background:#44413A;align-self:center" }),
+    make("span", { style: "font-size:14px;font-weight:600;letter-spacing:-.01em;color:" + INK, text: "앵챗추출기" }));
+  if (VER) title.append(make("span", {
+    style: "font-size:10px;font-weight:600;letter-spacing:.02em;color:" + FAINT + ";transform:translateY(-0.5px)",
+    text: VER
+  }));
+  panel.append(
+    make("div", { style: "display:flex;justify-content:space-between;align-items:center;margin-bottom:13px" },
+      title, make("span", { id: "__rp_x", title: "닫기", text: "✕" })),
+    make("div", { style: "background:#E7E3D8;border:1px solid #D9D4C7;border-radius:10px;padding:8px 10px;margin-bottom:11px" },
+      make("div", { style: "display:flex;align-items:center;justify-content:space-between;gap:10px" },
+        make("span", { style: "font-size:10.5px;font-weight:600;letter-spacing:.02em;color:" + LABEL, text: "인식된 플랫폼" }),
+        make("strong", { style: "font-size:12px;color:" + INK + ";font-weight:700", text: platform.name })),
+      make("div", { style: "margin-top:2px;text-align:right;font-size:10.5px;color:" + SOFT, text: platform.mode })),
+    make("div", { style: card },
+      row(label("파일 이름"), make("input", { id: "__rp_name", type: "text", value: DEFAULT_NAME, style: ctl })),
+      row(label("파일 형식"), make("div", { id: "__rp_fmt_wrap", className: "__rp_cselect_wrap" })),
+      row(label("분할 기준"), make("div", { id: "__rp_unit_wrap", className: "__rp_cselect_wrap" })),
+      make("div", { id: "__rp_numrow", style: rowS + ";margin-bottom:0" },
+        label(""), make("input", { id: "__rp_num", type: "number", min: "1", value: "600000", style: ctl }),
+        make("span", { id: "__rp_suffix", style: "font-size:12px;color:" + SOFT + ";white-space:nowrap;flex:none", text: "자마다" })),
+      make("label", { className: "__rp_check_label" },
+        make("input", { id: "__rp_expand", className: "__rp_check_input", type: "checkbox", checked: true }),
+        make("span", { className: "__rp_check_box", ariaHidden: "true" }),
+        make("span", { text: "상태창·위젯 등 접힌 토글도 펼쳐서 추출" })),
+      rule("12px 0 0"),
+      make("div", { style: "margin:11px 0 0" },
+        make("div", { style: "font-size:11px;font-weight:600;letter-spacing:.02em;color:" + LABEL + ";margin-bottom:8px", text: "추출 속도" }),
+        make("input", { id: "__rp_speed", type: "range", min: "0", max: "4", step: "1", value: "2" }),
+        make("div", { style: "display:flex;align-items:center;margin-top:7px;font-size:9.5px;letter-spacing:.02em;color:" + FAINT },
+          make("span", { style: "flex:1;text-align:left", text: "느림·안전" }),
+          make("span", { id: "__rp_spdlbl", style: "flex:1;text-align:center;font-size:11px;font-weight:700;color:" + INK, text: "보통" }),
+          make("span", { style: "flex:1;text-align:right", text: "빠름" })))),
+    button("__rp_auto", "__rp_auto", "자동 추출"),
+    rule("13px 2px"),
+    make("div", { className: "__rp_row", style: "margin-bottom:8px" },
+      button("__rp_load", "__rp_sec", "① 전체 로딩"),
+      button("__rp_ext", "__rp_sec", "② 추출·저장")),
+    button("__rp_stop", "__rp_stop", "정지"),
+    make("div", { id: "__rp_status", className: "__rp_status_card", text: "준비됨" }));
   document.body.appendChild(panel);
 
   for (const dir of ["n", "s", "e", "w", "ne", "nw", "se", "sw"]) {
@@ -1425,8 +1499,22 @@ function openPanel() {
   const fitFrame = requestAnimationFrame(fitPanelToViewport);
 
   // ── 커스텀 셀렉트 컴포넌트 생성자 ──
-  const checkSvg = '<svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.5L4.8 8.8L9.5 3.5" stroke="#44413A" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  const arrowSvg = '<svg class="__rp_cselect_arr" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  function selectIcon(kind) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("width", kind === "check" ? "12" : "10");
+    svg.setAttribute("height", kind === "check" ? "12" : "6");
+    svg.setAttribute("viewBox", kind === "check" ? "0 0 12 12" : "0 0 10 6");
+    if (kind === "check") svg.setAttribute("fill", "none");
+    else svg.setAttribute("class", "__rp_cselect_arr");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", kind === "check" ? "M2.5 6.5L4.8 8.8L9.5 3.5" : "M1 1L5 5L9 1");
+    path.setAttribute("stroke", kind === "check" ? "#44413A" : "currentColor");
+    path.setAttribute("stroke-width", kind === "check" ? "1.6" : "1.5");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.appendChild(path);
+    return svg;
+  }
 
   function createCustomSelect(wrapEl, options, defaultValue, onChange) {
     let currentVal = defaultValue;
@@ -1440,19 +1528,19 @@ function openPanel() {
     labelSpan.textContent = defaultOpt ? defaultOpt.label : "";
 
     btn.appendChild(labelSpan);
-    btn.insertAdjacentHTML("beforeend", arrowSvg);
+    btn.appendChild(selectIcon("arrow"));
 
     const menu = document.createElement("div");
     menu.className = "__rp_cselect_menu";
 
     function renderOptions() {
-      menu.innerHTML = "";
+      menu.replaceChildren();
       options.forEach((opt) => {
         const item = document.createElement("div");
         item.className = "__rp_cselect_opt" + (opt.value === currentVal ? " selected" : "");
         item.textContent = opt.label;
         if (opt.value === currentVal) {
-          item.insertAdjacentHTML("beforeend", checkSvg);
+          item.appendChild(selectIcon("check"));
         }
         item.onclick = (e) => {
           e.stopPropagation();
