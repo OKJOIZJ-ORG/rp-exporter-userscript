@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         앵챗추출기
 // @namespace    rp-exporter
-// @version      2.11.7
+// @version      2.11.8
 // @updateURL    https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/OKJOIZJ-ORG/rp-exporter-userscript/main/rp-exporter.user.js
 // @description  채팅 전체를 .txt로 내보냅니다. 파일명 지정 + 토글 추출 선택 + 자동/수동 로딩 + ZIP 분할.
@@ -37,7 +37,7 @@ function openPanel() {
   const OSC = 2;           // 한 사이클당 진동 횟수
   let SPEED_MULT = 1;      // 추출 속도 배수(작을수록 빠름) · 슬라이더로 실시간 조절
   const DEFAULT_NAME = "rp_chat";
-  const VER = "v2.11.7";
+  const VER = "v2.11.8";
 
   function waitForPanel(ms, frame = false) {
     return new Promise((resolve, reject) => {
@@ -252,6 +252,7 @@ function openPanel() {
       const el = node;
       const tag = el.tagName;
       if (el.id === ID || skipTags.has(tag) || el.hidden || el.getAttribute("aria-hidden") === "true") return;
+      if (IS_GEMINI_HOST && el.classList.contains("screen-reader-user-query-label")) return;
       const style = getComputedStyle(el);
       if (style.display === "none" || style.visibility === "hidden") return;
       if (tag === "BR") { newline(); return; }
